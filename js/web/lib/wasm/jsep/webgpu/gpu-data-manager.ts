@@ -79,6 +79,12 @@ export interface GpuDataManager {
 interface StorageCacheValue {
   gpuData: GpuData;
   originalSize: number;
+  /**
+   * Looking-Glass fix: tracks the last refreshPendingBuffers() cycle this entry was accessed via get().
+   * Entries not accessed for STALE_THRESHOLD cycles are auto-released (moved to freelist/destroyed).
+   * This fixes the memory leak where C++ WASM calls jsepAlloc but never jsepFree for intermediate buffers.
+   */
+  lastAccessedCycle: number;
 }
 
 const bucketFreelist: Map<number, number> = new Map([
@@ -135,6 +141,17 @@ const calcBucketBufferSize = (size: number) => {
 
 let guid = 1;
 const createNewGpuDataId = () => guid++;
+
+// ========== LOOKING-GLASS: STALE BUFFER SWEEP ==========
+// After this many refreshPendingBuffers() cycles without a get() call,
+// a storageCache entry is considered stale and auto-released.
+// refreshPendingBuffers() is called after every queue.submit() — roughly
+// ~40 times per inference frame. 200 cycles ≈ 5 inference frames of grace.
+const STALE_THRESHOLD = 200;
+let lgCurrentCycle = 0;
+// How often to run the sweep (not every cycle — too expensive)
+const SWEEP_INTERVAL = 50;
+// ========================================================
 
 /**
  * exported standard download function. This function is used by the session to download the data from GPU, and also by
@@ -254,6 +271,9 @@ class GpuDataManagerImpl implements GpuDataManager {
     this.backend.device.queue.submit([commandEncoder.finish()]);
     gpuBufferForUploading.destroy();
 
+    // Touch the access cycle — this buffer is actively being used
+    gpuDataCache.lastAccessedCycle = lgCurrentCycle;
+
     LOG_DEBUG('verbose', () => `[WebGPU] GpuDataManager.upload(id=${id})`);
   }
 
@@ -284,6 +304,10 @@ class GpuDataManagerImpl implements GpuDataManager {
       0,
       size,
     );
+
+    // Touch access cycle for both
+    sourceGpuDataCache.lastAccessedCycle = lgCurrentCycle;
+    destinationGpuDataCache.lastAccessedCycle = lgCurrentCycle;
   }
 
   registerExternalBuffer(buffer: GPUBuffer, originalSize: number, previous?: [GpuDataId, GPUBuffer]): number {
@@ -305,7 +329,11 @@ class GpuDataManagerImpl implements GpuDataManager {
       id = createNewGpuDataId();
     }
 
-    this.storageCache.set(id, { gpuData: { id, type: GpuDataType.default, buffer }, originalSize });
+    this.storageCache.set(id, {
+      gpuData: { id, type: GpuDataType.default, buffer },
+      originalSize,
+      lastAccessedCycle: lgCurrentCycle,
+    });
     LOG_DEBUG(
       'verbose',
       () => `[WebGPU] GpuDataManager.registerExternalBuffer(size=${originalSize}) => id=${id}, registered.`,
@@ -351,14 +379,20 @@ class GpuDataManagerImpl implements GpuDataManager {
     }
 
     const gpuData = { id: createNewGpuDataId(), type: GpuDataType.default, buffer: gpuBuffer };
-    this.storageCache.set(gpuData.id, { gpuData, originalSize: Number(size) });
+    this.storageCache.set(gpuData.id, { gpuData, originalSize: Number(size), lastAccessedCycle: lgCurrentCycle });
 
     LOG_DEBUG('verbose', () => `[WebGPU] GpuDataManager.create(size=${size}) => id=${gpuData.id}`);
     return gpuData;
   }
 
   get(id: GpuDataId): GpuData | undefined {
-    return this.storageCache.get(id)?.gpuData;
+    const cached = this.storageCache.get(id);
+    if (cached) {
+      // Touch: mark this entry as recently accessed so the stale sweep won't release it
+      cached.lastAccessedCycle = lgCurrentCycle;
+      return cached.gpuData;
+    }
+    return undefined;
   }
 
   release(idInput: GpuDataId): number {
@@ -377,7 +411,6 @@ class GpuDataManagerImpl implements GpuDataManager {
 
     this.storageCache.delete(id);
     this.buffersPending.push(cachedData.gpuData.buffer);
-    // cachedData.gpuData.buffer.destroy();
 
     return cachedData.originalSize;
   }
@@ -387,10 +420,41 @@ class GpuDataManagerImpl implements GpuDataManager {
     if (!cachedData) {
       throw new Error('data does not exist');
     }
+    // Touch: mark as accessed
+    cachedData.lastAccessedCycle = lgCurrentCycle;
     await downloadGpuData(this.backend, cachedData.gpuData.buffer, cachedData.originalSize, getTargetBuffer);
   }
 
   refreshPendingBuffers(): void {
+    // Advance the cycle counter
+    lgCurrentCycle++;
+
+    // ========== LOOKING-GLASS: STALE BUFFER SWEEP ==========
+    // Periodically scan storageCache for entries that haven't been accessed
+    // in STALE_THRESHOLD cycles. These are buffers the C++ WASM allocated
+    // via jsepAlloc but never freed via jsepFree. We release them properly
+    // through the normal release path (→ freelist or destroy).
+    if (lgCurrentCycle % SWEEP_INTERVAL === 0 && this.backend.sessionStatus === 'default') {
+      const staleIds: GpuDataId[] = [];
+      for (const [id, cached] of this.storageCache.entries()) {
+        const age = lgCurrentCycle - cached.lastAccessedCycle;
+        if (age > STALE_THRESHOLD && cached.gpuData.buffer.size >= 1048576) {
+          // Only sweep large buffers (≥1MB) — small ones are cheap
+          staleIds.push(id);
+        }
+      }
+      if (staleIds.length > 0) {
+        for (const id of staleIds) {
+          const cached = this.storageCache.get(id);
+          if (cached) {
+            this.storageCache.delete(id);
+            this.buffersPending.push(cached.gpuData.buffer);
+          }
+        }
+      }
+    }
+    // ========================================================
+
     if (this.buffersPending.length === 0) {
       return;
     }

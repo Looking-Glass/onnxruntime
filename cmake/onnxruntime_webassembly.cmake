@@ -355,14 +355,14 @@ else()
   #
   # Apply post-processing script for the generated JavaScript file
   #
-  list(APPEND onnxruntime_webassembly_script_deps "${ONNXRUNTIME_ROOT}/wasm/wasm_post_build.js")
+  list(APPEND onnxruntime_webassembly_script_deps "${ONNXRUNTIME_ROOT}/wasm/wasm_post_build.cjs")
   add_custom_command(
     TARGET onnxruntime_webassembly
     POST_BUILD
     # Backup file at $<TARGET_FILE_NAME:onnxruntime_webassembly>.bak
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE_NAME:onnxruntime_webassembly>" "$<TARGET_FILE_NAME:onnxruntime_webassembly>.bak"
     COMMAND ${CMAKE_COMMAND} -E echo "Performing post-process for $<TARGET_FILE_NAME:onnxruntime_webassembly>"
-    COMMAND ${NODE_EXECUTABLE} "${ONNXRUNTIME_ROOT}/wasm/wasm_post_build.js" "$<TARGET_FILE_NAME:onnxruntime_webassembly>"
+    COMMAND ${NODE_EXECUTABLE} "${ONNXRUNTIME_ROOT}/wasm/wasm_post_build.cjs" "$<TARGET_FILE_NAME:onnxruntime_webassembly>"
   )
 
   set_target_properties(onnxruntime_webassembly PROPERTIES LINK_DEPENDS "${onnxruntime_webassembly_script_deps}")
