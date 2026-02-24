@@ -4,6 +4,7 @@
 import * as esbuild from 'esbuild';
 import minimist from 'minimist';
 import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import { SourceMapConsumer, SourceMapGenerator } from 'source-map';
 
@@ -275,6 +276,20 @@ async function buildBundle(options: esbuild.BuildOptions) {
 }
 
 /**
+ * Returns true if the WASM .mjs artifacts required for ENABLE_BUNDLE_WASM_JS are present.
+ */
+function wasmMjsArtifactsExist(): boolean {
+  const distDir = path.join(SOURCE_ROOT_FOLDER, 'web/dist');
+  const candidates = [
+    'ort-wasm-simd-threaded.jsep.mjs',
+    'ort-wasm-simd-threaded.asyncify.mjs',
+    'ort-wasm-simd-threaded.jspi.mjs',
+    'ort-wasm-simd-threaded.mjs',
+  ];
+  return candidates.some((f) => fsSync.existsSync(path.join(distDir, f)));
+}
+
+/**
  * Build one ort-web target.
  *
  * The distribution code is split into multiple files:
@@ -303,6 +318,13 @@ async function buildOrt({
   }
 
   if (define['BUILD_DEFS.ENABLE_BUNDLE_WASM_JS'] === 'true') {
+    if (!wasmMjsArtifactsExist()) {
+      console.warn(
+        `[SKIP] Skipping bundle target "${outputName}" — WASM .mjs artifacts not found in dist/. ` +
+          `Run a full WASM build first to produce these files.`,
+      );
+      return;
+    }
     plugins.push({
       name: 'emscripten-mjs-handler',
       setup(build: esbuild.PluginBuild) {
